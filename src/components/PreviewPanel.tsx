@@ -18,6 +18,7 @@ export const PreviewPanel = forwardRef<
   canvasRef,
 ) {
   const lost = status.phase === 'context-lost';
+  const busy = status.phase === 'building' || status.phase === 'compiling';
   return (
     <div className="preview-panel">
       <div className="preview-head">
@@ -26,8 +27,14 @@ export const PreviewPanel = forwardRef<
           {statusLabel(status)}
         </span>
       </div>
-      <div className={`canvas-stage ${lost ? 'stage-lost' : ''}`}>
+      <div className={`canvas-stage ${lost ? 'stage-lost' : ''} ${busy ? 'stage-busy' : ''}`}>
         <canvas ref={canvasRef} width={360} height={360} className="preview-canvas" />
+        {busy && (
+          <div className="busy-overlay">
+            <strong>正在生成预览</strong>
+            <span>旧预览已撤下，等待当前画面就绪</span>
+          </div>
+        )}
         {lost && (
           <div className="lost-overlay">
             <strong>预览已失效</strong>

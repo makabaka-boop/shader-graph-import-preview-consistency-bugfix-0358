@@ -19,6 +19,19 @@ function rev(p: GraphPipeline): number {
   return (p.status as Extract<RevisionStatus, { revision: number }>).revision;
 }
 
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+};
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
 /**
  * 最小 WebGL2 模拟：编译/链接恒成功，记录程序创建次数，
  * 支持模拟上下文丢失（GL 调用全部失效）与恢复（状态归零）。
@@ -125,21 +138,29 @@ function fakeCanvas(gl: FakeGL2): HTMLCanvasElement {
 }
 
 class ManualSink implements BuildSink {
-  requested: number[] = [];
+  requested: { generation: number; revision: number }[] = [];
   private cb: ((r: BuildResult) => void) | null = null;
-  constructor(private graphs = new Map<number, Graph>()) {}
-  remember(rev: number, graph: Graph) {
-    this.graphs.set(rev, graph);
+  constructor(private graphs = new Map<string, Graph>()) {}
+  private key(generation: number, revision: number) {
+    return `${generation}:${revision}`;
   }
-  request(graph: Graph, revision: number) {
-    this.requested.push(revision);
-    this.graphs.set(revision, graph);
+  remember(generation: number, rev: number, graph: Graph) {
+    this.graphs.set(this.key(generation, rev), graph);
+  }
+  request(graph: Graph, generation: number, revision: number) {
+    this.requested.push({ generation, revision });
+    this.graphs.set(this.key(generation, revision), graph);
   }
   onResult(cb: (r: BuildResult) => void) {
     this.cb = cb;
   }
-  respond(rev: number) {
-    this.cb?.({ type: 'result', ...buildForRevision(rev, this.graphs.get(rev)!) });
+  respond(generation: number, rev: number) {
+    const graph = this.graphs.get(this.key(generation, rev))!;
+    this.cb?.({
+      type: 'result',
+      generation,
+      ...buildForRevision(rev, graph),
+    });
   }
 }
 
@@ -165,10 +186,22 @@ describe('WebGL 上下文丢失与恢复', () => {
 
     const sink = new ManualSink();
     const adapter = {
-      compile: vi.fn((revision: number, source: string) => {
-        const outcome = renderer.compileFragment(source);
-        return Promise.resolve({ revision, ok: outcome.ok, errors: outcome.errors });
+      compile: vi.fn((generation: number, revision: number, source: string) => {
+        const outcome = renderer.prepareFragment(source);
+        if (outcome.ok) {
+          return Promise.resolve({
+            generation,
+            revision,
+            ok: true,
+            errors: [],
+            commit: () => outcome.prepared.commit(),
+            discard: () => outcome.prepared.discard(),
+          });
+        }
+        renderer.deactivate();
+        return Promise.resolve({ generation, revision, ...outcome });
       }),
+      deactivate: () => renderer.deactivate(),
     };
     const pipe = new GraphPipeline(validGraph(3), sink, adapter);
     const lossSpy = vi.fn();
@@ -178,7 +211,7 @@ describe('WebGL 上下文丢失与恢复', () => {
     renderer.onRestore(() => pipe.notifyContextRestored());
 
     pipe.submit(validGraph(3));
-    sink.respond(3);
+    sink.respond(1, 3);
     await Promise.resolve();
     expect(pipe.status.phase).toBe('ready');
     const programsAfterFirst = gl.programCount;
@@ -195,16 +228,16 @@ describe('WebGL 上下文丢失与恢复', () => {
     expect(gl.drawCount).toBe(0);
 
     // 丢失期间到达的迟到 Worker 结果不得复活预览
-    sink.respond(3);
+    sink.respond(1, 3);
     expect(pipe.status.phase).toBe('context-lost');
 
     // 恢复：浏览器提供同一 canvas 的全新 GL 状态
     gl.lost = false;
     renderer.simulateRestoreForTests();
     expect(renderer.contextLost).toBe(false);
-    // pipeline 必须对当前修订重新发起完整构建
-    expect(sink.requested).toContain(3);
-    sink.respond(3);
+    // pipeline 必须对当前修订重新发起完整构建；代际与 revision 都必须匹配
+    expect(sink.requested).toContainEqual({ generation: 2, revision: 3 });
+    sink.respond(2, 3);
     await Promise.resolve();
     if (phase(pipe) !== 'ready') throw new Error(`expected ready, got ${phase(pipe)}`);
     expect(rev(pipe)).toBe(3);
@@ -222,16 +255,28 @@ describe('WebGL 上下文丢失与恢复', () => {
     const renderer = new WebGLRenderer(canvas);
     const sink = new ManualSink();
     const adapter = {
-      compile: vi.fn((revision: number, source: string) => {
-        const outcome = renderer.compileFragment(source);
-        return Promise.resolve({ revision, ok: outcome.ok, errors: outcome.errors });
+      compile: vi.fn((generation: number, revision: number, source: string) => {
+        const outcome = renderer.prepareFragment(source);
+        if (outcome.ok) {
+          return Promise.resolve({
+            generation,
+            revision,
+            ok: true,
+            errors: [],
+            commit: () => outcome.prepared.commit(),
+            discard: () => outcome.prepared.discard(),
+          });
+        }
+        renderer.deactivate();
+        return Promise.resolve({ generation, revision, ...outcome });
       }),
+      deactivate: () => renderer.deactivate(),
     };
     const pipe = new GraphPipeline(validGraph(2), sink, adapter);
     renderer.onLoss(() => pipe.notifyContextLost());
     renderer.onRestore(() => pipe.notifyContextRestored());
     pipe.submit(validGraph(2));
-    sink.respond(2);
+    sink.respond(1, 2);
     await Promise.resolve();
     expect(pipe.status.phase).toBe('ready');
 
@@ -244,9 +289,77 @@ describe('WebGL 上下文丢失与恢复', () => {
     expect(rev(pipe)).toBe(5);
 
     renderer.simulateRestoreForTests();
-    sink.respond(5);
+    sink.respond(3, 5);
     await Promise.resolve();
     if (phase(pipe) !== 'ready') throw new Error('expected ready');
     expect(rev(pipe)).toBe(5);
+  });
+
+  it('恢复前排队的同修订旧编译结果不能在恢复后短暂上屏', async () => {
+    const gl = new FakeGL2();
+    const canvas = fakeCanvas(gl);
+    const renderer = new WebGLRenderer(canvas);
+    const sink = new ManualSink();
+    const oldCompile = deferred<{
+      generation: number;
+      revision: number;
+      ok: boolean;
+      errors: string[];
+      commit: () => void;
+      discard: () => void;
+    }>();
+    let oldCommitted = false;
+    const adapter = {
+      compile: vi.fn((generation: number, revision: number, source: string) => {
+        if (generation === 1) {
+          return oldCompile.promise;
+        }
+        const outcome = renderer.prepareFragment(source);
+        if (!outcome.ok) throw new Error(outcome.errors[0]);
+        return Promise.resolve({
+          generation,
+          revision,
+          ok: true,
+          errors: [],
+          commit: () => outcome.prepared.commit(),
+          discard: () => outcome.prepared.discard(),
+        });
+      }),
+      deactivate: () => renderer.deactivate(),
+    };
+    const pipe = new GraphPipeline(validGraph(3), sink, adapter);
+    renderer.onLoss(() => pipe.notifyContextLost());
+    renderer.onRestore(() => pipe.notifyContextRestored());
+
+    pipe.submit(validGraph(3)); // generation 1
+    sink.respond(1, 3);
+    expect(pipe.status.phase).toBe('compiling');
+
+    renderer.simulateLossForTests();
+    gl.lost = false;
+    renderer.simulateRestoreForTests();
+    expect(pipe.status.phase).toBe('building');
+
+    // 恢复前 generation 1 的编译结果迟到
+    oldCompile.resolve({
+      generation: 1,
+      revision: 3,
+      ok: true,
+      errors: [],
+      commit: () => {
+        oldCommitted = true;
+      },
+      discard: () => {},
+    });
+    await Promise.resolve();
+    expect(oldCommitted).toBe(false);
+    expect(pipe.status.phase).toBe('building');
+    expect(gl.drawCount).toBe(0);
+
+    // 只有恢复后 generation 2 的完整流程可以上屏
+    sink.respond(2, 3);
+    await Promise.resolve();
+    expect(pipe.status.phase).toBe('ready');
+    expect(rev(pipe)).toBe(3);
   });
 });

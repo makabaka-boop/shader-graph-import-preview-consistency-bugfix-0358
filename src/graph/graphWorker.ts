@@ -12,6 +12,7 @@ ctx.onmessage = (ev: MessageEvent<BuildRequest>) => {
   const out = buildForRevision(msg.revision, msg.graph);
   const response: BuildResult = {
     type: 'result',
+    generation: msg.generation,
     revision: out.revision,
     ok: out.ok,
     issues: out.issues,

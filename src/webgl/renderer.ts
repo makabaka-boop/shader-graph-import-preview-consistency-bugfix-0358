@@ -1,17 +1,24 @@
 import { VERTEX_SHADER } from '../graph/glslgen';
 
-export interface CompileOutcome {
-  ok: boolean;
-  errors: string[];
+export interface PreparedFragment {
+  source: string;
+  /** 在流水线确认该结果属于当前代际后调用，真正替换正在显示的程序。 */
+  commit: () => void;
+  /** 结果已过期或上下文丢失时删除暂存程序。 */
+  discard: () => void;
 }
+
+export type CompileOutcome =
+  | { ok: true; errors: []; prepared: PreparedFragment }
+  | { ok: false; errors: string[] };
 
 type Listener = () => void;
 
 /**
  * WebGL2 渲染器：负责编译页面生成的片段着色器并在全屏三角形上执行。
  * 显式处理 webglcontextlost / webglcontextrestored：
- * 丢失后停止渲染并上抛事件；恢复后重建全部 GL 资源并重放当前着色器，
- * 绝不沿用旧画面。
+ * 丢失后停止渲染并上抛事件；恢复后只重建 GL 资源、清空旧程序与画布，
+ * 等待流水线重新生成并提交，绝不沿用或重放旧画面。
  */
 export class WebGLRenderer {
   private canvas: HTMLCanvasElement;
@@ -19,7 +26,6 @@ export class WebGLRenderer {
   private program: WebGLProgram | null = null;
   private vao: WebGLVertexArrayObject | null = null;
   private uTimeLoc: WebGLUniformLocation | null = null;
-  private currentSource: string | null = null;
   private rafId = 0;
   private startTime = performance.now();
   private running = false;
@@ -71,12 +77,14 @@ export class WebGLRenderer {
   private handleRestore = () => {
     this.lost = false;
     this.startTime = performance.now();
-    // 恢复后重建当前合法图对应的资源与程序，而非显示旧画面
+    // 恢复后画布与程序必须保持空白；等待流水线对当前图重新构建并提交，
+    // 绝不重放 context lost 前缓存的 source。
+    this.program = null;
+    this.uTimeLoc = null;
+    this.running = false;
+    this.rafId = 0;
     this.initResources();
-    if (this.currentSource) {
-      const result = this.compileFragment(this.currentSource);
-      if (result.ok) this.start();
-    }
+    this.clearCanvas();
     this.restoreListeners.forEach((cb) => cb());
   };
 
@@ -103,7 +111,7 @@ export class WebGLRenderer {
   private initResources() {
     const gl = this.gl;
     const vs = this.compileShader(gl.VERTEX_SHADER, VERTEX_SHADER);
-    // 顶点着色器固定，片段着色器后续通过 setFragmentSource 链入。
+    // 顶点着色器固定，片段着色器后续经 prepareFragment 编译并在代际校验后提交。
     // 这里先保存 vs，编译片段时再链接。
     this.builtinVS = vs;
 
@@ -124,8 +132,11 @@ export class WebGLRenderer {
 
   private builtinVS: WebGLShader | null = null;
 
-  /** 编译并链接着色器；失败保留旧程序（若有）并返回错误信息。 */
-  compileFragment(source: string): CompileOutcome {
+  /**
+   * 编译并链接新片段着色器，但先暂存程序，不改变当前画面。
+   * 调用方完成代际校验后执行 prepared.commit()；过期结果调用 discard()。
+   */
+  prepareFragment(source: string): CompileOutcome {
     if (this.lost) return { ok: false, errors: ['WebGL 上下文已丢失'] };
     const gl = this.gl;
     try {
@@ -143,14 +154,46 @@ export class WebGLRenderer {
         gl.deleteProgram(program);
         return { ok: false, errors: [log] };
       }
-      if (this.program) gl.deleteProgram(this.program);
-      this.program = program;
-      this.uTimeLoc = gl.getUniformLocation(program, 'uTime');
-      this.currentSource = source;
-      return { ok: true, errors: [] };
+
+      let committed = false;
+      const discard = () => {
+        if (committed) return;
+        gl.deleteProgram(program);
+      };
+      const commit = () => {
+        if (committed || this.lost) return;
+        committed = true;
+        if (this.program) gl.deleteProgram(this.program);
+        this.program = program;
+        this.uTimeLoc = gl.getUniformLocation(program, 'uTime');
+        this.start();
+      };
+
+      return {
+        ok: true,
+        errors: [],
+        prepared: { source, commit, discard },
+      };
     } catch (err) {
       return { ok: false, errors: [err instanceof Error ? err.message : String(err)] };
     }
+  }
+
+  /** 新图开始构建时立即撤下旧图程序，避免等待期间继续显示旧颜色。 */
+  deactivate() {
+    this.stop();
+    if (this.program && !this.lost) this.gl.deleteProgram(this.program);
+    this.program = null;
+    this.uTimeLoc = null;
+    this.clearCanvas();
+  }
+
+  private clearCanvas() {
+    if (this.lost || !this.vao) return;
+    const gl = this.gl;
+    gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    gl.clearColor(0, 0, 0, 1);
+    gl.clear(gl.COLOR_BUFFER_BIT);
   }
 
   private frame = () => {

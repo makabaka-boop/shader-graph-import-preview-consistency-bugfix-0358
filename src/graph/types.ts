@@ -43,7 +43,10 @@ export interface Edge {
 export interface Graph {
   nodes: GraphNode[];
   edges: Edge[];
-  /** 当前修订号：每次结构性编辑 / 参数修改递增，移动节点不递增。 */
+  /**
+   * 文件内修订号：结构性编辑 / 参数修改递增，移动节点不递增。
+   * 导入文件可能复用相同 revision；异步防串改还需结合 pipeline 的 generation。
+   */
   revision: number;
 }
 

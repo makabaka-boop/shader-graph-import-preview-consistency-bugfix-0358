@@ -357,6 +357,26 @@ body {
 .stage-lost .preview-canvas {
   filter: grayscale(1) brightness(0.4);
 }
+.stage-busy .preview-canvas {
+  filter: brightness(0.35);
+}
+.busy-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: rgba(0, 0, 0, 0.35);
+  color: #fff;
+  font-size: 12px;
+  text-align: center;
+}
+.busy-overlay span {
+  color: var(--muted);
+  font-size: 11px;
+}
 .lost-overlay {
   position: absolute;
   inset: 0;
