@@ -10,16 +10,24 @@ type Listener = () => void;
 /**
  * WebGL2 渲染器：负责编译页面生成的片段着色器并在全屏三角形上执行。
  * 显式处理 webglcontextlost / webglcontextrestored：
- * 丢失后停止渲染并上抛事件；恢复后重建全部 GL 资源并重放当前着色器，
- * 绝不沿用旧画面。
+ * 丢失后停止渲染并上抛事件；恢复后只重建 GL 骨架，【绝不自行重放旧源码】，
+ * 真正的着色器由 pipeline 对当前图重新生成、编译并确认代次后提交，
+ * 因此恢复后不可能闪回旧修订的画面。
+ *
+ * 编译分两步，避免迟到编译直接换屏：
+ *  - compileFragment 只把链接好的程序放进 pending，不动正在显示的程序；
+ *  - commitPending 由 pipeline 在确认编译结果属于当前代次后调用，
+ *    新程序此时才上屏；被丢弃的迟到编译永远不会显示。
  */
 export class WebGLRenderer {
   private canvas: HTMLCanvasElement;
   gl: WebGL2RenderingContext;
   private program: WebGLProgram | null = null;
+  /** 已编译链接、但尚未经 pipeline 代次确认的程序。 */
+  private pendingProgram: WebGLProgram | null = null;
+  private pendingUTimeLoc: WebGLUniformLocation | null = null;
   private vao: WebGLVertexArrayObject | null = null;
   private uTimeLoc: WebGLUniformLocation | null = null;
-  private currentSource: string | null = null;
   private rafId = 0;
   private startTime = performance.now();
   private running = false;
@@ -60,8 +68,11 @@ export class WebGLRenderer {
     this.running = false;
     if (this.rafId) cancelAnimationFrame(this.rafId);
     this.rafId = 0;
-    // 旧的 GL 资源随上下文一起失效，清空引用避免误用旧画面
+    // 全部 GL 资源随上下文一起失效，清空引用：既不能继续显示旧画面，
+    // 也不能在恢复时把旧源码/旧程序重新提交。
     this.program = null;
+    this.pendingProgram = null;
+    this.pendingUTimeLoc = null;
     this.vao = null;
     this.builtinVS = null;
     this.uTimeLoc = null;
@@ -71,12 +82,10 @@ export class WebGLRenderer {
   private handleRestore = () => {
     this.lost = false;
     this.startTime = performance.now();
-    // 恢复后重建当前合法图对应的资源与程序，而非显示旧画面
+    // 仅重建与具体着色器无关的 GL 骨架；旧片段程序引用已在丢失时清空，
+    // 这里绝不重新编译旧片段着色器——pipeline 收到恢复事件后会对当前图
+    // 走完整 Worker 生成 → 编译 → commit 流程，由其决定显示内容。
     this.initResources();
-    if (this.currentSource) {
-      const result = this.compileFragment(this.currentSource);
-      if (result.ok) this.start();
-    }
     this.restoreListeners.forEach((cb) => cb());
   };
 
@@ -103,8 +112,7 @@ export class WebGLRenderer {
   private initResources() {
     const gl = this.gl;
     const vs = this.compileShader(gl.VERTEX_SHADER, VERTEX_SHADER);
-    // 顶点着色器固定，片段着色器后续通过 setFragmentSource 链入。
-    // 这里先保存 vs，编译片段时再链接。
+    // 顶点着色器固定，片段着色器后续通过 compileFragment 链入。
     this.builtinVS = vs;
 
     const vao = gl.createVertexArray();
@@ -124,7 +132,19 @@ export class WebGLRenderer {
 
   private builtinVS: WebGLShader | null = null;
 
-  /** 编译并链接着色器；失败保留旧程序（若有）并返回错误信息。 */
+  /** 放弃尚未上屏的 pending 程序（编译失败或被更新代次顶替时调用）。 */
+  private discardPending() {
+    if (this.pendingProgram) {
+      this.gl.deleteProgram(this.pendingProgram);
+      this.pendingProgram = null;
+    }
+    this.pendingUTimeLoc = null;
+  }
+
+  /**
+   * 编译并链接着色器到 pending（不上屏）。失败只丢弃 pending，
+   * 正在显示的旧程序不受影响（是否停循环由 pipeline 决定）。
+   */
   compileFragment(source: string): CompileOutcome {
     if (this.lost) return { ok: false, errors: ['WebGL 上下文已丢失'] };
     const gl = this.gl;
@@ -132,6 +152,7 @@ export class WebGLRenderer {
       const fs = this.compileShader(gl.FRAGMENT_SHADER, source);
       const program = gl.createProgram();
       if (!program || !fs || !this.builtinVS) {
+        this.discardPending();
         return { ok: false, errors: ['无法创建着色器程序'] };
       }
       gl.attachShader(program, this.builtinVS);
@@ -141,16 +162,33 @@ export class WebGLRenderer {
       if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
         const log = gl.getProgramInfoLog(program) ?? '未知链接错误';
         gl.deleteProgram(program);
+        this.discardPending();
         return { ok: false, errors: [log] };
       }
-      if (this.program) gl.deleteProgram(this.program);
-      this.program = program;
-      this.uTimeLoc = gl.getUniformLocation(program, 'uTime');
-      this.currentSource = source;
+      // 新 pending 顶替旧 pending（迟到但未提交的编译结果直接释放）
+      this.discardPending();
+      this.pendingProgram = program;
+      this.pendingUTimeLoc = gl.getUniformLocation(program, 'uTime');
       return { ok: true, errors: [] };
     } catch (err) {
+      this.discardPending();
       return { ok: false, errors: [err instanceof Error ? err.message : String(err)] };
     }
+  }
+
+  /**
+   * 把 pending 程序提交上屏。仅在 pipeline 确认该编译属于当前代次后调用，
+   * 因此迟到编译不可能替换正在显示的画面。
+   */
+  commitPending(): boolean {
+    if (this.lost || !this.pendingProgram) return false;
+    const gl = this.gl;
+    if (this.program) gl.deleteProgram(this.program);
+    this.program = this.pendingProgram;
+    this.uTimeLoc = this.pendingUTimeLoc;
+    this.pendingProgram = null;
+    this.pendingUTimeLoc = null;
+    return true;
   }
 
   private frame = () => {
@@ -193,7 +231,7 @@ export class WebGLRenderer {
 
   /**
    * 测试用：模拟上下文丢失/恢复（jsdom/无头环境无法真正触发事件）。
-   * restored=true 时按真实恢复路径重建资源。
+   * restored=true 时按真实恢复路径重建资源（不含旧程序）。
    */
   simulateLossForTests() {
     this.handleLoss(new Event('webglcontextlost'));

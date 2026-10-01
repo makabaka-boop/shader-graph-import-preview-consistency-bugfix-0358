@@ -74,11 +74,11 @@ function Shell({
   const adapterRef = useRef<CompileAdapter | null>(null);
   const delegatingAdapter = useMemo<CompileAdapter>(
     () => ({
-      compile: (revision, source) => {
+      compile: (token, revision, source) => {
         const target = adapterRef.current;
         // 渲染器尚未就绪：挂起等待（初始修订为非法图，不会产生编译）
         if (!target) return new Promise(() => {});
-        return target.compile(revision, source);
+        return target.compile(token, revision, source);
       },
     }),
     [],

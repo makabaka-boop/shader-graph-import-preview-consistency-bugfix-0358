@@ -28,15 +28,24 @@
 - **Worker 排序与代码生成**：`src/graph/graphWorker.ts` →
   `buildForRevision`（`build.ts`，校验+排序）→ `generateFragmentShader`
   （`glslgen.ts`，严格按拓扑序逐行生成）。
-- **修订号（revision）防迟到覆盖**：每次结构性编辑/改参数 `revision + 1`
-  （移动节点不递增）。`src/graph/pipeline.ts` 对 Worker 结果与 GLSL 编译结果
-  一律校验 `revision === currentRevision`，落后的迟到结果直接丢弃。
+- **构建代次（token）防迟到覆盖**：结构变化（节点种类/参数/连线，忽略坐标）
+  使 `revision + 1` 并领取会话内单调递增、绝不重复的构建 token；移动节点既不
+  递增修订也不更换 token。`src/graph/pipeline.ts` 对 Worker 结果与 GLSL 编译
+  结果一律校验 `token === 当前代次`，落后的迟到结果（哪怕修订号恰好与新图相同）
+  直接丢弃。这覆盖“导入一份同修订号的旧导出图”：修订号会撞号，token 不会。
+- **编译结果两步上屏**：`renderer.compileFragment` 只把链接好的程序放入
+  pending、不改变正在显示的画面；pipeline 确认 token 仍为当前代次后才调用
+  `commitPending` 上屏。迟到编译因此不可能闪回旧颜色。
+- **移动节点与导出布局**：任何图引用变化（含不递增修订的 move-node）都会同步
+  到 pipeline；纯布局变化不重新生成/编译，但会失效导出缓存。`captureExport`
+  仅在修订、GLSL、布局指纹三者都一致时才复用截图包，故导出的图布局永远跟页面一致。
 - **上下文丢失/恢复**：`src/webgl/renderer.ts` 监听
   `webglcontextlost`（`preventDefault` 以允许恢复）/`webglcontextrestored`。
-  丢失时丢弃全部 GL 资源引用、停止 RAF，页面显示“预览已失效”遮罩，且任何迟到
-  结果不得复活预览；恢复时重建资源，并由 pipeline 对**当前修订**重新走
-  Worker 生成 → GLSL 编译的完整流程，绝不沿用旧画面。
-- **导出一致性**：仅 `ready` 可导出；`captureExport` 把**同一修订**的
+  丢失时丢弃全部 GL 资源引用（含 pending 程序与旧源码）、停止 RAF，页面显示
+  “预览已失效”遮罩，且任何迟到结果不得复活预览；恢复时**只重建 GL 骨架、绝不
+  自行重放旧源码**，并由 pipeline 以全新 token 对**当前图**重新走
+  Worker 生成 → GLSL 编译 → 提交上屏的完整流程，同修订号的旧代次结果也无法重现。
+- **导出一致性**：仅 `ready` 可导出；`captureExport` 把**同一就绪结果**的
   图数据（结构化克隆）、GLSL 源码与画布 PNG 截图原子打包为一个 JSON 快照。
 
 ## 常用命令
@@ -44,7 +53,7 @@
 ```bash
 npm install
 npm run dev        # 开发
-npm test           # 22 个测试（node 环境，WebGL 用最小 mock）
+npm test           # 27 个测试（node 环境，WebGL 用最小 mock）
 npm run build      # 类型检查 + 生产构建
 ```
 
@@ -56,9 +65,12 @@ npm run build      # 类型检查 + 生产构建
 - `src/graph/build.test.ts` — **生成顺序**：拓扑序的先于关系、输出排最后；
   GLSL 语句顺序、uniform/提升/标量与 vec3 变体；非法图不生成；断开节点不生成。
 - `src/graph/pipeline.test.ts` — **迟到结果**：迟到的 Worker 结果与迟到的
-  GLSL 编译结果都不能覆盖较新修订；非法图不触发编译；导出快照锁定修订。
+  GLSL 编译结果都不能覆盖较新代次（迟到编译连屏幕都上不了）；非法图不触发编译；
+  导出快照锁定内容。**同修订号导入**：必须重新构建、旧代次结果一律丢弃、导出的是
+  新图。**只移动节点**：不重建但导出布局跟随页面、布局不变时复用截图。
 - `src/webgl/context.test.ts` — **上下文恢复**：丢失标失效、迟到结果不复活、
-  恢复后重建并重新编译当前修订（含丢失期间编辑后的最新修订）。
+  恢复瞬间不重放旧程序、恢复后以新代次重建当前图（含丢失期间编辑后的最新修订）、
+  恢复后同修订号旧代次结果不得重现旧预览。
 
 ## 操作
 
